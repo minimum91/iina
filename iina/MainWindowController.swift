@@ -43,6 +43,10 @@ fileprivate let UIAnimationDuration = 0.25
 fileprivate let OSDAnimationDuration = 0.5
 fileprivate let SideBarAnimationDuration = 0.2
 fileprivate let CropAnimationDuration = 0.2
+fileprivate let VideoZoomAnimationDuration = 0.2
+
+/** How far pinching can zoom into the video in full screen. */
+fileprivate let VideoZoomMax = 4.0
 
 
 fileprivate extension NSStackView.VisibilityPriority {
@@ -174,6 +178,14 @@ class MainWindowController: PlayerWindowController {
 
   var lastMagnification: CGFloat = 0.0
   var frameWhenStartedPinching = NSRect()
+
+  /** Zoom and pan of the video when the current zoom gesture or animation started. */
+  fileprivate var videoZoomStart: VideoZoomState?
+  /** Whether the video was zoomed by pinching, which is undone when leaving full screen. */
+  fileprivate var isVideoZoomedByPinch = false
+  fileprivate var videoZoomAnimationTimer: Timer?
+  /** Whether the current two-finger scroll moves the zoomed-in video. */
+  fileprivate var isPanningZoomedVideo = false
 
   /** Views that will show/hide when cursor moving in/out the window. */
   var fadeableViews: [NSView] = []
@@ -1071,6 +1083,7 @@ class MainWindowController: PlayerWindowController {
 
   override func scrollWheel(with event: NSEvent) {
     guard !isInInteractiveMode else { return }
+    if panZoomedVideo(with: event) { return }
     if !isMomentumScrollingAllowed && !event.momentumPhase.isEmpty {
       // ignore delta caused by abrupt momentum phases
       return
@@ -1105,6 +1118,16 @@ class MainWindowController: PlayerWindowController {
 
     seekOverride = false
     volumeOverride = false
+  }
+
+  /// Double-tapping with two fingers in full screen zooms into the video, or back out if zoomed in.
+  override func smartMagnify(with event: NSEvent) {
+    guard isVideoZoomAllowed else {
+      super.smartMagnify(with: event)
+      return
+    }
+    let anchor = videoView.convert(event.locationInWindow, from: nil)
+    animateVideoZoom(to: videoZoom > 1 ? 1 : 2, anchor: anchor)
   }
 
   override func mouseEntered(with event: NSEvent) {
@@ -1187,7 +1210,11 @@ class MainWindowController: PlayerWindowController {
         }
       }
     case .windowSize:
-      if fsState.isFullscreen { return }
+      if fsState.isFullscreen {
+        // The window can't be resized in full screen, zoom into the video instead.
+        zoomVideo(with: recognizer)
+        return
+      }
 
       // adjust window size
       if recognizer.state == .began {
@@ -1292,6 +1319,7 @@ class MainWindowController: PlayerWindowController {
     if pipStatus == .inPIP {
       exitPIP()
     }
+    resetVideoZoom()
     // stop playing
     if case .fullscreen(legacy: true, priorWindowedFrame: _) = fsState {
       restoreDockSettings()
@@ -1491,6 +1519,7 @@ class MainWindowController: PlayerWindowController {
   ///     [willExitFullScreenNotification](https://developer.apple.com/documentation/appkit/nswindow/willexitfullscreennotification).
   func windowWillExitFullScreen(_ notification: Notification) {
     log("Exiting full screen mode")
+    resetVideoZoom()
     // When playback is paused the display link is stopped in order to avoid wasting energy on
     // needless processing. It must be running while transitioning from full screen mode.
     videoView.displayActive()
@@ -2395,6 +2424,8 @@ class MainWindowController: PlayerWindowController {
   func enterInteractiveMode(_ mode: InteractiveMode, selectWholeVideoByDefault: Bool = false) {
     // prerequisites
     guard !isInInteractiveMode, let window = window else { return }
+    // The crop box is laid out for the whole video.
+    resetVideoZoom()
 
     let (ow, oh) = player.originalVideoSize
     guard ow != 0 && oh != 0 else {
@@ -3325,6 +3356,171 @@ class MainWindowController: PlayerWindowController {
 
 }
 
+// MARK: - Pinch to zoom
+
+/// The video's zoom and pan when a zoom gesture or animation started.
+fileprivate struct VideoZoomState {
+  /// Zoom factor, 1 is the normal size.
+  let zoom: Double
+  let panX: Double
+  let panY: Double
+  /// The point in `videoView` whose part of the video stays in place while zooming.
+  let anchor: NSPoint
+}
+
+extension MainWindowController {
+
+  /// In full screen, where "Pinch to: Adjust window size" can't resize the window, pinching zooms
+  /// into the video instead.
+  fileprivate var isVideoZoomAllowed: Bool {
+    guard case .fullscreen = fsState, pinchAction == .windowSize, !isInInteractiveMode,
+          pipStatus == .notInPIP, player.info.state.active else { return false }
+    return true
+  }
+
+  /// The zoom factor. mpv's `video-zoom` is its base 2 logarithm.
+  fileprivate var videoZoom: Double {
+    pow(2, player.mpv.getDouble(MPVOption.Video.videoZoom))
+  }
+
+  /// The size of the video in `videoView` when not zoomed, or `nil` if it has no size yet.
+  private var unzoomedVideoSize: NSSize? {
+    let (width, height) = player.videoSizeForDisplay
+    let size = NSSize(width: width, height: height).shrink(toSize: videoView.bounds.size)
+    return size.width > 0 && size.height > 0 ? size : nil
+  }
+
+  /// Returns how far the video can be panned either way without uncovering an edge of the screen.
+  /// mpv pans by fractions of the zoomed video's size.
+  private func maxVideoPan(zoomedLength: Double, viewLength: CGFloat) -> Double {
+    max(0, 0.5 - Double(viewLength) / (2 * zoomedLength))
+  }
+
+  private func currentVideoZoomState(anchor: NSPoint) -> VideoZoomState {
+    VideoZoomState(zoom: videoZoom, panX: player.mpv.getDouble(MPVOption.Video.videoPanX),
+                   panY: player.mpv.getDouble(MPVOption.Video.videoPanY), anchor: anchor)
+  }
+
+  fileprivate func zoomVideo(with recognizer: NSMagnificationGestureRecognizer) {
+    guard isVideoZoomAllowed else { return }
+    switch recognizer.state {
+    case .began:
+      stopVideoZoomAnimation()
+      videoZoomStart = currentVideoZoomState(anchor: recognizer.location(in: videoView))
+    case .changed:
+      guard let start = videoZoomStart else { return }
+      setVideoZoom(start.zoom * exp(Double(recognizer.magnification)), from: start)
+    default:
+      videoZoomStart = nil
+    }
+  }
+
+  /// Zooms the video to `zoom` times its normal size. The part of the video at the anchor of
+  /// `start` stays in place, as far as possible without uncovering an edge of the screen.
+  private func setVideoZoom(_ zoom: Double, from start: VideoZoomState) {
+    guard let videoSize = unzoomedVideoSize else { return }
+    let zoom = zoom.clamped(to: 1...VideoZoomMax)
+    let viewSize = videoView.bounds.size
+    func pan(from startPan: Double, anchorOffset: CGFloat, videoLength: CGFloat,
+             viewLength: CGFloat) -> Double {
+      let startLength = Double(videoLength) * start.zoom
+      let zoomedLength = Double(videoLength) * zoom
+      let pan = startPan + Double(anchorOffset) * (1 / zoomedLength - 1 / startLength)
+      let limit = maxVideoPan(zoomedLength: zoomedLength, viewLength: viewLength)
+      return pan.clamped(to: -limit...limit)
+    }
+    // mpv pans right and down, view coordinates increase right and up.
+    let panX = pan(from: start.panX, anchorOffset: start.anchor.x - viewSize.width / 2,
+                   videoLength: videoSize.width, viewLength: viewSize.width)
+    let panY = pan(from: start.panY, anchorOffset: viewSize.height / 2 - start.anchor.y,
+                   videoLength: videoSize.height, viewLength: viewSize.height)
+    setVideoZoomAndPan(zoom: zoom, panX: panX, panY: panY)
+  }
+
+  private func setVideoZoomAndPan(zoom: Double, panX: Double, panY: Double) {
+    player.mpv.setDouble(MPVOption.Video.videoZoom, log2(zoom), level: .verbose)
+    player.mpv.setDouble(MPVOption.Video.videoPanX, panX, level: .verbose)
+    player.mpv.setDouble(MPVOption.Video.videoPanY, panY, level: .verbose)
+    isVideoZoomedByPinch = zoom > 1
+  }
+
+  /// Moves the zoomed-in video with two-finger scrolling in full screen. Returns `false` if the
+  /// event is not for that, and gets its usual handling (seeking, volume, etc).
+  fileprivate func panZoomedVideo(with event: NSEvent) -> Bool {
+    // Mouse wheels keep their usual function.
+    guard event.hasPreciseScrollingDeltas else { return false }
+    if event.phase.contains(.began) {
+      isPanningZoomedVideo = isVideoZoomAllowed && videoZoom > 1 &&
+        !isMouseEvent(event, inAnyOf: [currentControlBar, titleBarView, sideBarView, subPopoverView])
+    }
+    guard isPanningZoomedVideo else { return false }
+    // Momentum scrolling continues the pan.
+    if event.phase.contains(.cancelled) || event.momentumPhase.contains(.ended) ||
+        event.momentumPhase.contains(.cancelled) {
+      isPanningZoomedVideo = false
+    }
+    guard isVideoZoomAllowed, let videoSize = unzoomedVideoSize else { return true }
+    let zoom = videoZoom
+    let viewSize = videoView.bounds.size
+    // The deltas follow the scroll direction setting. Positive values move content right and
+    // down, as mpv's pan does.
+    func pan(_ property: String, by delta: CGFloat, videoLength: CGFloat, viewLength: CGFloat) {
+      let zoomedLength = Double(videoLength) * zoom
+      let limit = maxVideoPan(zoomedLength: zoomedLength, viewLength: viewLength)
+      let pan = player.mpv.getDouble(property) + Double(delta) / zoomedLength
+      player.mpv.setDouble(property, pan.clamped(to: -limit...limit), level: .verbose)
+    }
+    pan(MPVOption.Video.videoPanX, by: event.scrollingDeltaX, videoLength: videoSize.width,
+        viewLength: viewSize.width)
+    pan(MPVOption.Video.videoPanY, by: event.scrollingDeltaY, videoLength: videoSize.height,
+        viewLength: viewSize.height)
+    return true
+  }
+
+  /// Zooms the video to `zoom` in a short animation, keeping the part of the video at `anchor` in place.
+  fileprivate func animateVideoZoom(to zoom: Double, anchor: NSPoint) {
+    stopVideoZoomAnimation()
+    let start = currentVideoZoomState(anchor: anchor)
+    guard !Preference.bool(for: .disableAnimations) else {
+      setVideoZoom(zoom, from: start)
+      return
+    }
+    let startTime = CACurrentMediaTime()
+    let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
+      guard let self else {
+        timer.invalidate()
+        return
+      }
+      let progress = min(1, (CACurrentMediaTime() - startTime) / VideoZoomAnimationDuration)
+      // Ease out, at a steady rate on the logarithmic zoom scale.
+      let easedProgress = progress * (2 - progress)
+      setVideoZoom(start.zoom * pow(zoom / start.zoom, easedProgress), from: start)
+      if progress == 1 {
+        stopVideoZoomAnimation()
+      }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    videoZoomAnimationTimer = timer
+  }
+
+  private func stopVideoZoomAnimation() {
+    videoZoomAnimationTimer?.invalidate()
+    videoZoomAnimationTimer = nil
+  }
+
+  /// Zooms back out if the video was zoomed by pinching.
+  fileprivate func resetVideoZoom() {
+    stopVideoZoomAnimation()
+    videoZoomStart = nil
+    isPanningZoomedVideo = false
+    guard isVideoZoomedByPinch else { return }
+    isVideoZoomedByPinch = false
+    // Must not access mpv while it is stopping.
+    guard player.info.state.active else { return }
+    setVideoZoomAndPan(zoom: 1, panX: 0, panY: 0)
+  }
+}
+
 // MARK: - Picture in Picture
 
 extension MainWindowController: PIPViewControllerDelegate {
@@ -3332,6 +3528,7 @@ extension MainWindowController: PIPViewControllerDelegate {
   func enterPIP() {
     guard pipStatus != .inPIP else { return }
     pipStatus = .inPIP
+    resetVideoZoom()
     showUI()
 
     pipVideo = NSViewController()

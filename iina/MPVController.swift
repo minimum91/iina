@@ -560,8 +560,11 @@ class MPVController: NSObject {
     }
     setUserOption(PK.ytdlRawOptions, type: .string, forName: MPVOption.ProgramBehavior.ytdlRawOptions,
                   verboseIfDefault: true)
+    // Zooming in by pinching is per file.
     chkErr(setOptionString(MPVOption.ProgramBehavior.resetOnNextFile,
-            "\(MPVOption.PlaybackControl.abLoopA),\(MPVOption.PlaybackControl.abLoopB)", level: .verbose))
+            "\(MPVOption.PlaybackControl.abLoopA),\(MPVOption.PlaybackControl.abLoopB)," +
+            "\(MPVOption.Video.videoZoom),\(MPVOption.Video.videoPanX),\(MPVOption.Video.videoPanY)",
+            level: .verbose))
 
     setUserOption(PK.audioDriverEnableAVFoundation, type: .other, forName: MPVOption.Audio.ao,
                   verboseIfDefault: true) { key in
@@ -653,6 +656,14 @@ class MPVController: NSObject {
          !watchLaterOptions.contains(MPVOption.Subtitles.secondarySubDelay) {
         log("Adding \(MPVOption.Subtitles.secondarySubDelay) to \(MPVOption.WatchLater.watchLaterOptions)")
         watchLaterOptions += "," + MPVOption.Subtitles.secondarySubDelay
+        needsUpdate = true
+      }
+      // Zooming in by pinching is temporary, the file should open unzoomed next time.
+      let zoomOptions = [MPVOption.Video.videoZoom, MPVOption.Video.videoPanX, MPVOption.Video.videoPanY]
+      let options = watchLaterOptions.components(separatedBy: ",")
+      if options.contains(where: zoomOptions.contains) {
+        log("Removing video zoom and pan from \(MPVOption.WatchLater.watchLaterOptions)")
+        watchLaterOptions = options.filter { !zoomOptions.contains($0) }.joined(separator: ",")
         needsUpdate = true
       }
       if needsUpdate {
