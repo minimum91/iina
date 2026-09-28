@@ -194,6 +194,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     return Preference.bool(for: .receiveBetaUpdate) ? AppData.appcastBetaLink : AppData.appcastLink
   }
 
+  /// This is an unofficial build. Installing an official update would replace it, so only check for
+  /// updates when the user asks to.
+  func updater(_ updater: SPUUpdater, mayPerform updateCheck: SPUUpdateCheck) throws {
+    guard updateCheck != .updatesInBackground else {
+      throw NSError(domain: "IINA", code: 1, userInfo: [
+        NSLocalizedDescriptionKey: "Automatic update checks are disabled in this build"])
+    }
+  }
+
   // MARK: - App Delegate
 
   func applicationWillFinishLaunching(_ notification: Notification) {
