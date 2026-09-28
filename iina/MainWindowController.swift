@@ -1669,6 +1669,16 @@ class MainWindowController: PlayerWindowController {
   }
 
   private func restoreDockSettings() {
+    // The menu bar and Dock must stay hidden while another window is in legacy full screen mode.
+    let otherWindowInLegacyFullScreen = PlayerCore.playerCores.contains {
+      guard $0 !== player, let otherWindow = $0.mainWindow else { return false }
+      if case .fullscreen(legacy: true, priorWindowedFrame: _) = otherWindow.fsState { return true }
+      return false
+    }
+    guard !otherWindowInLegacyFullScreen else {
+      log("Not restoring dock settings, another window is in legacy full screen mode")
+      return
+    }
     log("Restoring dock settings")
     NSApp.presentationOptions.remove(.autoHideMenuBar)
     NSApp.presentationOptions.remove(.autoHideDock)
@@ -1742,7 +1752,10 @@ class MainWindowController: PlayerWindowController {
       window.styleMask.remove(.titled)
       window.hasShadow = false
       (window as! MainWindow).forceKeyAndMain = true
-      window.level = .floating
+      // Stay at the normal window level, as IINA Advance does. At the floating level the window
+      // covers the windows of every other app, even after switching away from IINA. The menu bar
+      // and Dock are still hidden while IINA is the active app. See issue #5644.
+      window.level = .normal
     } else {
       window.styleMask.insert(.fullScreen)
     }
